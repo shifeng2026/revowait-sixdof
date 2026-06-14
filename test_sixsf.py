@@ -35,9 +35,16 @@ import socket
 import sys
 import threading
 import time
-from typing import Any, Optional, Tuple
+from collections import deque
+from typing import Optional
 
 import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
 
 _project_dir = os.path.dirname(os.path.abspath(__file__))
 if _project_dir not in sys.path:
@@ -68,6 +75,13 @@ from udp_service import UdpBindError, bind_udp_listen_socket
 MID_POSE_ABS = np.array([0, 0, 920, 0, 0, 0], dtype=float)
 DEFAULT_POSE_Z_OFFSET_MM = 10.0
 
+# FK 坐标 → 控制器坐标：X/Y/RX/RY 取反
+_FK_TO_CONTROLLER_SIGN = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0])
+
+# 实时曲线默认滚动窗口（秒）
+_PLOT_WINDOW_SEC = 10.0
+_PLOT_MAX_POINTS = 300
+
 
 class SixAxisPlatform:
     """六轴平台控制接口"""
@@ -81,6 +95,7 @@ class SixAxisPlatform:
         self._listen_sock: socket.socket | None = None
         self._latest: dict | None = None
         self._lock = threading.Lock()
+        self._tracked_lock = threading.Lock()
 
         self._formula = CylinderFormula()
         self._proto_map: tuple = tuple(UI_TO_INTERNAL)
@@ -92,6 +107,15 @@ class SixAxisPlatform:
 
         self.last_error: str | None = None
         self._tracked_rel: np.ndarray = np.zeros(6)  # 开环追踪最近一次目标/反馈位姿（角度为弧度）
+
+        # ── 实时曲线状态 ──
+        self._plot_enabled = False
+        self._plot_data: dict | None = None  # {t, pose_rel(6), vel(6)}
+        self._plot_buffers: dict | None = None  # {t: deque, pose: [deque×6], vel: [deque×6]}
+        self._plot_fig: plt.Figure | None = None
+        self._plot_axes: list[plt.Axes] | None = None
+        self._plot_lines_pos: list[plt.Line2D] | None = None
+        self._plot_lines_vel: list[plt.Line2D] | None = None
 
         self.load_config(config_path)
 
@@ -252,8 +276,15 @@ class SixAxisPlatform:
 
     # ── 3. 实时读取位姿 + 扭矩（调用时实时正解） ──────────────
 
-    def read_current_pose(self) -> dict | None:
-        """返回最新 UDP 反馈，实时正解，输出绝对位姿 + 相对 home 增量"""
+    def read_current_pose(self, show_plot: bool = False) -> dict | None:
+        """
+        返回最新 UDP 反馈，实时正解，输出绝对位姿 + 相对 home 增量。
+
+        Parameters
+        ----------
+        show_plot : bool
+            True 时弹出实时位置/速度曲线窗口（需 matplotlib）。
+        """
         snap = self._get_latest()
         if snap is None:
             self.last_error = "未收到 UDP 反馈"
@@ -273,14 +304,13 @@ class SixAxisPlatform:
             self.last_error = f"FK 正解失败: {e}"
 
         if pose_raw is not None:
-            # FK 坐标 → 控制器坐标：X/Y/RX/RY 取反
-            _SIGN = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0])
-            pose_raw = pose_raw * _SIGN
+            pose_raw = pose_raw * _FK_TO_CONTROLLER_SIGN
 
         home = self._platform.home_pose
         if pose_raw is not None:
             delta = pose_raw - home
-            self._tracked_rel = delta.copy()
+            with self._tracked_lock:
+                self._tracked_rel = delta.copy()
             pose_deg = [round(delta[0], 2), round(delta[1], 2), round(delta[2], 2),
                         round(np.degrees(delta[3]), 4),
                         round(np.degrees(delta[4]), 4),
@@ -289,7 +319,7 @@ class SixAxisPlatform:
             delta = None
             pose_deg = None
 
-        return {
+        result = {
             "timestamp": snap["timestamp"],
             "pose_raw": pose_raw.tolist() if pose_raw is not None else None,
             "pose_rel": delta.tolist() if delta is not None else None,
@@ -302,6 +332,11 @@ class SixAxisPlatform:
             "fk_residual": fk_res,
             "error_code": snap["error_code"],
         }
+
+        if show_plot and delta is not None:
+            self._update_realtime_plot(snap["timestamp"], delta)
+
+        return result
 
     # ── 2. 设置目标位姿（相对中位增量） ─────────────────────
 
@@ -330,7 +365,8 @@ class SixAxisPlatform:
 
         target_mid_rad = target_mid.copy()
         target_mid_rad[3:] = np.radians(target_mid_rad[3:])
-        self._tracked_rel = target_mid_rad.copy()
+        with self._tracked_lock:
+            self._tracked_rel = target_mid_rad.copy()
         return True
 
     # ── 4. 电缸伸长量 -> 位姿（正解） ────────────────────────
@@ -427,6 +463,85 @@ class SixAxisPlatform:
             time.sleep(0.02)
         return None
 
+    # ── 9. 实时位置/速度曲线 ─────────────────────────────────
+
+    def _init_realtime_plot(self) -> bool:
+        """初始化 matplotlib 实时曲线窗口"""
+        if not _HAS_MPL:
+            self.last_error = "matplotlib 未安装，无法显示实时曲线"
+            return False
+
+        if self._plot_fig is not None:
+            return True
+
+        axis_labels = ["X (mm)", "Y (mm)", "Z (mm)", "RX (°)", "RY (°)", "RZ (°)"]
+        fig, axes = plt.subplots(2, 3, figsize=(15, 6))
+        fig.canvas.manager.set_window_title("六轴平台实时反馈")
+
+        lines_pos = []
+        lines_vel = []
+        for i, ax in enumerate(axes.flat):
+            ax.set_title(axis_labels[i])
+            ax.set_xlabel("时间 (s)")
+            ax.grid(True, alpha=0.3)
+            line_p, = ax.plot([], [], "b-", lw=1.5, label="位置")
+            ax_twin = ax.twinx()
+            line_v, = ax_twin.plot([], [], "r--", lw=1, alpha=0.7, label="速度")
+            ax_twin.legend(loc="upper right", fontsize=8)
+            lines_pos.append(line_p)
+            lines_vel.append(line_v)
+
+        fig.tight_layout()
+        plt.ion()
+        fig.show()
+        fig.canvas.draw()
+
+        self._plot_fig = fig
+        self._plot_axes = list(axes.flat)
+        self._plot_lines_pos = lines_pos
+        self._plot_lines_vel = lines_vel
+
+        buf_len = _PLOT_MAX_POINTS
+        self._plot_buffers = {
+            "t": deque(maxlen=buf_len),
+            "pose": [deque(maxlen=buf_len) for _ in range(6)],
+            "vel": [deque(maxlen=buf_len) for _ in range(6)],
+        }
+        return True
+
+    def _update_realtime_plot(self, timestamp: float, pose_rel: np.ndarray) -> None:
+        """向曲线追加一个新数据点并刷新窗口"""
+        if not self._init_realtime_plot():
+            return
+
+        buf = self._plot_buffers
+        if buf is None:
+            return
+
+        t_elapsed = timestamp - buf["t"][-1] if buf["t"] else 0.0
+        buf["t"].append(timestamp)
+
+        for i in range(6):
+            v = pose_rel[i] if i < 3 else np.degrees(pose_rel[i])
+            buf["pose"][i].append(v)
+            if t_elapsed > 0 and len(buf["pose"][i]) >= 2:
+                dv = (v - list(buf["pose"][i])[-2]) / t_elapsed
+            else:
+                dv = 0.0
+            buf["vel"][i].append(dv)
+
+        t_min = timestamp - _PLOT_WINDOW_SEC
+        t_arr = list(buf["t"])
+
+        for i in range(6):
+            self._plot_lines_pos[i].set_data(t_arr, list(buf["pose"][i]))
+            self._plot_lines_vel[i].set_data(t_arr, list(buf["vel"][i]))
+            self._plot_axes[i].relim()
+            self._plot_axes[i].set_xlim(t_min, timestamp)
+
+        self._plot_fig.canvas.draw_idle()
+        self._plot_fig.canvas.flush_events()
+
     def move_pose_s_curve(self, target_pose: list[float], duration: float = 2.0) -> bool:
         """
         S 型规划：在 duration 秒内从当前位置插补到 target_pose。
@@ -482,7 +597,8 @@ class SixAxisPlatform:
         if not ok:
             self.last_error = msg
             return False
-        self._tracked_rel[:] = 0.0
+        with self._tracked_lock:
+            self._tracked_rel[:] = 0.0
         return True
 
 
