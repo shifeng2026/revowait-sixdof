@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -81,6 +81,10 @@ _FK_TO_CONTROLLER_SIGN = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0])
 # 实时曲线默认滚动窗口（秒）
 _PLOT_WINDOW_SEC = 10.0
 _PLOT_MAX_POINTS = 300
+_SCURVE_DT_SEC = 0.02
+_TARGET_POS_TOL_MM = 0.5
+_TARGET_ATT_TOL_DEG = 0.05
+_TARGET_STABLE_SAMPLES = 5
 
 
 class SixAxisPlatform:
@@ -109,13 +113,14 @@ class SixAxisPlatform:
         self._tracked_rel: np.ndarray = np.zeros(6)  # 开环追踪最近一次目标/反馈位姿（角度为弧度）
 
         # ── 实时曲线状态 ──
-        self._plot_enabled = False
-        self._plot_data: dict | None = None  # {t, pose_rel(6), vel(6)}
-        self._plot_buffers: dict | None = None  # {t: deque, pose: [deque×6], vel: [deque×6]}
+        self._plot_buffers: dict | None = None
         self._plot_fig: plt.Figure | None = None
         self._plot_axes: list[plt.Axes] | None = None
+        self._plot_twin_axes: list[plt.Axes] | None = None
         self._plot_lines_pos: list[plt.Line2D] | None = None
         self._plot_lines_vel: list[plt.Line2D] | None = None
+        self._animation: Any = None
+        self._plot_lock = threading.Lock()
 
         self.load_config(config_path)
 
@@ -276,7 +281,7 @@ class SixAxisPlatform:
 
     # ── 3. 实时读取位姿 + 扭矩（调用时实时正解） ──────────────
 
-    def read_current_pose(self, show_plot: bool = False) -> dict | None:
+    def read_current_pose(self, show_plot: bool = False, record_error: bool = True) -> dict | None:
         """
         返回最新 UDP 反馈，实时正解，输出绝对位姿 + 相对 home 增量。
 
@@ -284,10 +289,13 @@ class SixAxisPlatform:
         ----------
         show_plot : bool
             True 时弹出实时位置/速度曲线窗口（需 matplotlib）。
+        record_error : bool
+            True 时把读取/FK/绘图错误写入 last_error；后台显示线程应使用 False。
         """
         snap = self._get_latest()
         if snap is None:
-            self.last_error = "未收到 UDP 反馈"
+            if record_error:
+                self.last_error = "未收到 UDP 反馈"
             return None
 
         strokes = np.array(snap["strokes_internal"], dtype=float)
@@ -301,13 +309,15 @@ class SixAxisPlatform:
                 strokes, guess=self._platform.home_pose.copy(), enforce_stroke_limits=False
             )
         except Exception as e:
-            self.last_error = f"FK 正解失败: {e}"
+            if record_error:
+                self.last_error = f"FK 正解失败: {e}"
 
         if pose_raw is not None:
             pose_raw = pose_raw * _FK_TO_CONTROLLER_SIGN
 
         home = self._platform.home_pose
         if pose_raw is not None:
+            self.last_error = None
             delta = pose_raw - home
             with self._tracked_lock:
                 self._tracked_rel = delta.copy()
@@ -333,7 +343,7 @@ class SixAxisPlatform:
             "error_code": snap["error_code"],
         }
 
-        if show_plot and delta is not None:
+        if show_plot and delta is not None and self._plot_buffers is not None:
             self._update_realtime_plot(snap["timestamp"], delta)
 
         return result
@@ -363,6 +373,7 @@ class SixAxisPlatform:
             self.last_error = msg
             return False
 
+        self.last_error = None
         target_mid_rad = target_mid.copy()
         target_mid_rad[3:] = np.radians(target_mid_rad[3:])
         with self._tracked_lock:
@@ -436,9 +447,7 @@ class SixAxisPlatform:
             time.sleep(0.01)
 
         # ── 3. stop ────────────────────────────────────────────
-        ok, msg = self._client.send(build_plat_stop())
-        if not ok:
-            self.last_error = msg
+        if not self._send_stop():
             return False
 
         time.sleep(0.05)
@@ -457,16 +466,45 @@ class SixAxisPlatform:
         """等待 UDP 反馈到达，返回 pose_raw；超时返回 None"""
         t0 = time.time()
         while time.time() - t0 < timeout:
-            cur = self.read_current_pose()
+            cur = self.read_current_pose(record_error=False)
             if cur is not None and cur.get("pose_raw") is not None:
                 return np.array(cur["pose_raw"], dtype=float)
             time.sleep(0.02)
         return None
 
+    def _controller_rel_from_abs(self, pose_abs: np.ndarray) -> np.ndarray:
+        """绝对反馈位姿 -> 相对中位的控制位姿；平移 mm，姿态 deg。"""
+        rel = np.asarray(pose_abs, dtype=float) - MID_POSE_ABS
+        rel[3:] = np.degrees(rel[3:])
+        return rel
+
+    @staticmethod
+    def _pose_close_to_target(
+        pose_rel: np.ndarray,
+        target_rel: np.ndarray,
+        *,
+        pos_tol_mm: float = _TARGET_POS_TOL_MM,
+        att_tol_deg: float = _TARGET_ATT_TOL_DEG,
+    ) -> bool:
+        diff = np.abs(np.asarray(pose_rel, dtype=float) - np.asarray(target_rel, dtype=float))
+        return bool(np.all(diff[:3] <= pos_tol_mm) and np.all(diff[3:] <= att_tol_deg))
+
+    def _send_stop(self) -> bool:
+        ok, msg = self._client.send(build_plat_stop())
+        if not ok:
+            self.last_error = msg
+            return False
+        self.last_error = None
+        return True
+
     # ── 9. 实时位置/速度曲线 ─────────────────────────────────
 
-    def _init_realtime_plot(self) -> bool:
-        """初始化 matplotlib 实时曲线窗口"""
+    def start_realtime_plot(self) -> bool:
+        """
+        在主线程中调用，弹出 matplotlib 实时曲线窗口。
+        FuncAnimation 定时从缓冲区读取数据刷新曲线。
+        read_current_pose(show_plot=True) 仅向缓冲区追加数据。
+        """
         if not _HAS_MPL:
             self.last_error = "matplotlib 未安装，无法显示实时曲线"
             return False
@@ -474,105 +512,153 @@ class SixAxisPlatform:
         if self._plot_fig is not None:
             return True
 
-        axis_labels = ["X (mm)", "Y (mm)", "Z (mm)", "RX (°)", "RY (°)", "RZ (°)"]
-        fig, axes = plt.subplots(2, 3, figsize=(15, 6))
-        fig.canvas.manager.set_window_title("六轴平台实时反馈")
+        try:
+            plt.ion()
+            axis_labels = ["X mm", "Y mm", "Z mm", "RX deg", "RY deg", "RZ deg"]
+            fig, axes = plt.subplots(2, 3, figsize=(15, 6))
+            manager = getattr(fig.canvas, "manager", None)
+            if manager is not None and hasattr(manager, "set_window_title"):
+                manager.set_window_title("6-axis realtime feedback")
 
-        lines_pos = []
-        lines_vel = []
-        for i, ax in enumerate(axes.flat):
-            ax.set_title(axis_labels[i])
-            ax.set_xlabel("时间 (s)")
-            ax.grid(True, alpha=0.3)
-            line_p, = ax.plot([], [], "b-", lw=1.5, label="位置")
-            ax_twin = ax.twinx()
-            line_v, = ax_twin.plot([], [], "r--", lw=1, alpha=0.7, label="速度")
-            ax_twin.legend(loc="upper right", fontsize=8)
-            lines_pos.append(line_p)
-            lines_vel.append(line_v)
+            lines_pos = []
+            lines_vel = []
+            twin_axes = []
+            for i, ax in enumerate(axes.flat):
+                ax.set_title(axis_labels[i])
+                ax.set_xlabel("t (s)")
+                ax.grid(True, alpha=0.3)
+                line_p, = ax.plot([], [], "b-", lw=1.5, label="pos")
+                ax_twin = ax.twinx()
+                line_v, = ax_twin.plot([], [], "r--", lw=1, alpha=0.7, label="vel")
+                ax_twin.legend(loc="upper right", fontsize=8)
+                lines_pos.append(line_p)
+                lines_vel.append(line_v)
+                twin_axes.append(ax_twin)
 
-        fig.tight_layout()
-        plt.ion()
-        fig.show()
-        fig.canvas.draw()
+            fig.tight_layout()
+            self._plot_fig = fig
+            self._plot_axes = list(axes.flat)
+            self._plot_twin_axes = twin_axes
+            self._plot_lines_pos = lines_pos
+            self._plot_lines_vel = lines_vel
 
-        self._plot_fig = fig
-        self._plot_axes = list(axes.flat)
-        self._plot_lines_pos = lines_pos
-        self._plot_lines_vel = lines_vel
+            buf_len = _PLOT_MAX_POINTS
+            self._plot_buffers = {
+                "t": deque(maxlen=buf_len),
+                "pose": [deque(maxlen=buf_len) for _ in range(6)],
+                "vel": [deque(maxlen=buf_len) for _ in range(6)],
+            }
 
-        buf_len = _PLOT_MAX_POINTS
-        self._plot_buffers = {
-            "t": deque(maxlen=buf_len),
-            "pose": [deque(maxlen=buf_len) for _ in range(6)],
-            "vel": [deque(maxlen=buf_len) for _ in range(6)],
-        }
-        return True
+            from matplotlib.animation import FuncAnimation
+
+            def animate(_frame):
+                buf = self._plot_buffers
+                if buf is None or not buf["t"]:
+                    return
+                with self._plot_lock:
+                    t_arr = list(buf["t"])
+                    pose_snap = [list(buf["pose"][i]) for i in range(6)]
+                    vel_snap = [list(buf["vel"][i]) for i in range(6)]
+                t_now = t_arr[-1]
+                t_min = t_now - _PLOT_WINDOW_SEC
+                for i in range(6):
+                    self._plot_lines_pos[i].set_data(t_arr, pose_snap[i])
+                    self._plot_lines_vel[i].set_data(t_arr, vel_snap[i])
+                    self._plot_axes[i].relim()
+                    self._plot_twin_axes[i].relim()
+                    self._plot_axes[i].autoscale_view(scalex=False, scaley=True)
+                    self._plot_twin_axes[i].autoscale_view(scalex=False, scaley=True)
+                    self._plot_axes[i].set_xlim(t_min, t_now if t_now > t_min else t_min + 1.0)
+
+            self._animation = FuncAnimation(fig, animate, interval=50, cache_frame_data=False)
+            fig.show()
+            self.last_error = None
+            return True
+        except Exception as e:
+            self._plot_buffers = None
+            self._plot_fig = None
+            self._plot_axes = None
+            self._plot_twin_axes = None
+            self._plot_lines_pos = None
+            self._plot_lines_vel = None
+            self._animation = None
+            self.last_error = f"实时曲线初始化失败: {e}"
+            return False
 
     def _update_realtime_plot(self, timestamp: float, pose_rel: np.ndarray) -> None:
-        """向曲线追加一个新数据点并刷新窗口"""
-        if not self._init_realtime_plot():
-            return
-
+        """向缓冲区追加数据点（线程安全），不碰 GUI。"""
         buf = self._plot_buffers
         if buf is None:
             return
 
-        t_elapsed = timestamp - buf["t"][-1] if buf["t"] else 0.0
-        buf["t"].append(timestamp)
+        with self._plot_lock:
+            t_elapsed = timestamp - buf["t"][-1] if buf["t"] else 0.0
+            buf["t"].append(timestamp)
 
-        for i in range(6):
-            v = pose_rel[i] if i < 3 else np.degrees(pose_rel[i])
-            buf["pose"][i].append(v)
-            if t_elapsed > 0 and len(buf["pose"][i]) >= 2:
-                dv = (v - list(buf["pose"][i])[-2]) / t_elapsed
-            else:
-                dv = 0.0
-            buf["vel"][i].append(dv)
+            for i in range(6):
+                v = pose_rel[i] if i < 3 else np.degrees(pose_rel[i])
+                prev_v = buf["pose"][i][-1] if buf["pose"][i] else None
+                buf["pose"][i].append(v)
+                if t_elapsed > 0 and prev_v is not None:
+                    dv = (v - prev_v) / t_elapsed
+                else:
+                    dv = 0.0
+                buf["vel"][i].append(dv)
 
-        t_min = timestamp - _PLOT_WINDOW_SEC
-        t_arr = list(buf["t"])
+    def close(self) -> None:
+        """关闭实时曲线窗口。"""
+        if self._animation is not None:
+            self._animation.event_source.stop()
+            self._animation = None
+        if self._plot_fig is not None:
+            plt.close(self._plot_fig)
+            self._plot_fig = None
+        self._plot_buffers = None
+        self._plot_axes = None
+        self._plot_twin_axes = None
+        self._plot_lines_pos = None
+        self._plot_lines_vel = None
 
-        for i in range(6):
-            self._plot_lines_pos[i].set_data(t_arr, list(buf["pose"][i]))
-            self._plot_lines_vel[i].set_data(t_arr, list(buf["vel"][i]))
-            self._plot_axes[i].relim()
-            self._plot_axes[i].set_xlim(t_min, timestamp)
-
-        self._plot_fig.canvas.draw_idle()
-        self._plot_fig.canvas.flush_events()
-
-    def move_pose_s_curve(self, target_pose: list[float], duration: float = 2.0) -> bool:
+    def move_pose_s_curve(
+        self,
+        target_pose: list[float],
+        duration: float = 2.0,
+        *,
+        settle_timeout: float = 5.0,
+    ) -> bool:
         """
         S 型规划：在 duration 秒内从当前位置插补到 target_pose。
         target_pose 是相对中位 (MID_POSE_ABS) 的增量
         [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]。
         起点 = 当前绝对位姿 .pose_raw − MID_POSE_ABS，统一到中位坐标系。
-        内部 10ms 循环调用 set_pose。
+        轨迹发送完成后轮询反馈，到位并稳定后发送 stop，成功后返回 True。
         """
         if not self.connected:
             self.last_error = "未连接"
             return False
 
+        self.last_error = None
         cur_abs = self._wait_for_pose()
         if cur_abs is None:
-            print("  [警告] 未收到 UDP 反馈，使用 MID_POSE_ABS 作为当前位姿")
-            cur_abs = MID_POSE_ABS.copy()
-        else:
-            print(f"当前绝对位姿: {cur_abs.tolist()}")
+            self.last_error = "未收到 UDP 反馈，无法确认 S 曲线起点"
+            return False
 
-        start_rel = cur_abs - MID_POSE_ABS
+        print(f"当前绝对位姿: {cur_abs.tolist()}")
+        start_rel = self._controller_rel_from_abs(cur_abs)
         print(f"中位绝对位姿: {MID_POSE_ABS.tolist()}")
         print(f"(中位 - home_pose Z差: {MID_POSE_ABS[2] - self._platform.home_pose[2]:.1f}mm)")
-        start_rel[3:] = np.degrees(start_rel[3:])
 
         target = np.array(target_pose, dtype=float)
+        if target.shape != (6,):
+            self.last_error = "target_pose 需要 6 个值 [x_mm,y_mm,z_mm,rx_deg,ry_deg,rz_deg]"
+            return False
+
         delta = target - start_rel
         print(f"当前位姿 (相对中位): {start_rel.tolist()}")
         print(f"目标位姿 (相对中位): {target.tolist()}")
         print(f"位姿增量: {delta.tolist()}")
-        
-        dt = 0.02
+
+        dt = _SCURVE_DT_SEC
         steps = max(2, int(duration / dt))
 
         for i in range(1, steps + 1):
@@ -580,11 +666,32 @@ class SixAxisPlatform:
             s = 3 * t * t - 2 * t * t * t
             interp = (start_rel + s * delta).tolist()
             if not self.set_pose(interp):
+                self._send_stop()
                 return False
-            print(f"点{i}:{interp}")
+            print(f"pt{i}:{interp}")
             time.sleep(dt)
 
-        return True
+        stable_cnt = 0
+        deadline = time.time() + settle_timeout
+        while time.time() < deadline:
+            cur = self.read_current_pose()
+            if cur is not None and cur.get("pose_raw") is not None:
+                pose_rel = self._controller_rel_from_abs(np.array(cur["pose_raw"], dtype=float))
+                if self._pose_close_to_target(pose_rel, target):
+                    stable_cnt += 1
+                    if stable_cnt >= _TARGET_STABLE_SAMPLES:
+                        if not self._send_stop():
+                            return False
+                        self.last_error = None
+                        return True
+                else:
+                    stable_cnt = 0
+
+            time.sleep(0.02)
+
+        self._send_stop()
+        self.last_error = f"S curve target settle timeout: target={target.tolist()}"
+        return False
 
     # ── 7. 回原点 ────────────────────────────────────────────
 
@@ -628,9 +735,9 @@ def _print_pose(line_header, data):
         print(f"    T:[{t[0]:5d} {t[1]:5d} {t[2]:5d} {t[3]:5d} {t[4]:5d} {t[5]:5d}]")
 
 
-def _demo_read_worker(plat, stop_event):
+def _demo_read_worker(plat, stop_event, show_plot=False):
     while not stop_event.is_set():
-        data = plat.read_current_pose()
+        data = plat.read_current_pose(show_plot=show_plot, record_error=False)
         if data is not None and data.get("pose_raw") is not None:
             r = data["pose_raw"]
             s = data["strokes"]
@@ -651,36 +758,36 @@ def _demo(ip=None, port=8080):
     else:
         print(f"  connected: {plat.connected}")
 
-        # ── 启动异步读取线程 ──────────────────────────────────
-        print("--- 2. 异步读取线程已启动 (0.01s间隔) ---")
+        # ── 主线程创建实时曲线窗口（可选） ────────────────────
+        show_plot = True   # 改成 False 则不弹窗
+        if show_plot:
+            plat.start_realtime_plot()
+        print("--- 2. 异步读取线程已启动" + (" (带实时曲线)" if show_plot else "") + " ---")
+
         stop_read = threading.Event()
-        read_thread = threading.Thread(target=_demo_read_worker, args=(plat, stop_read), daemon=True)
+        read_thread = threading.Thread(target=_demo_read_worker, args=(plat, stop_read, show_plot), daemon=True)
         read_thread.start()
-        # plat.move_to_home()
-        # plat.move_to_mid()
-        # build_plat_top
-        # ── 回到原点 ───────────────────────────────────────────
-        # plat.set_pose([200, 0, 0, 0, 0, 0])
-        # time.sleep(2)
 
-        print("--- 3. move_pose_s_curve: [0,0,0,0,0,0] 2s ---")
-        plat.move_pose_s_curve([0, 0, 0, 0, 0, 10], duration=1.0)
-        time.sleep(2)
+        print("--- 3. move_pose_s_curve: [0,0,0,0,0,5] 1s ---")
+        ok = plat.move_pose_s_curve([0, 0, 0, 0, 0, 5], duration=1.0)
+        print(f"  move_pose_s_curve returned: {ok}, last_error={plat.last_error}")
 
-        # print("--- 4. move_pose_s_curve: [50,0,100,5,0,0] 3s ---")
-        # plat.move_pose_s_curve([0, 0, 100, 0, 0, 0], duration=3.0)
-        # time.sleep(2)
+        # ── 泵 GUI 事件循环，FuncAnimation 才能刷新曲线 ──────
+        print("--- 4. sleep 10s (GUI active) ---")
+        t_end = time.time() + 10
+        while time.time() < t_end:
+            if show_plot and _HAS_MPL:
+                plt.pause(0.05)
+            else:
+                time.sleep(0.05)
 
-        # print("--- 5. move_pose_s_curve: [0,0,0,0,0,0] (回零) 2s ---")
-        # plat.move_pose_s_curve([0, 0, 100, 0, 0, 0], duration=2.0)
-        # time.sleep(2)
-        # time.sleep(5)
         # ── 停止读取线程 ──────────────────────────────────────
         stop_read.set()
         read_thread.join(timeout=2)
 
         # ── 断开 ──────────────────────────────────────────────
-        print("--- 6. disconnect ---")
+        print("--- 5. disconnect ---")
+        plat.close()
         plat.disconnect()
         print(f"  connected: {plat.connected}")
         print()
@@ -691,9 +798,4 @@ def _demo(ip=None, port=8080):
 
 
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="六轴平台控制接口演示")
-    ap.add_argument("--ip", default=None, help="platform IP (default: from config)")
-    ap.add_argument("--port", type=int, default=8080, help="platform port")
-    args = ap.parse_args()
-    _demo("192.168.31.88", 8080)
+    _demo()
