@@ -16,11 +16,10 @@ import numpy as np
 
 from calibration import internal_array_to_ui
 from protocol_udp import (
-    CylinderFormula,
     CyclicFeedback,
+    CylinderFormula,
     absolute_lengths_from_strokes,
     parse_udp_packet,
-    protocol_lengths_to_internal,
     pulses_to_strokes_internal,
 )
 from stewart_fk import StewartPlatform
@@ -161,8 +160,8 @@ class UdpFkReceiver:
         strokes_int = pulses_to_strokes_internal(
             fb.pulses, self.config.formula, idx_map
         )
-        L0 = self.platform.L0
-        lengths_int = absolute_lengths_from_strokes(strokes_int, L0)
+        l0 = self.platform.L0
+        lengths_int = absolute_lengths_from_strokes(strokes_int, l0)
         strokes_ui = list(internal_array_to_ui(np.array(strokes_int)))
         lengths_ui = list(internal_array_to_ui(np.array(lengths_int)))
 

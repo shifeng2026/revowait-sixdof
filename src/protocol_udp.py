@@ -271,9 +271,9 @@ def pulses_to_strokes_internal(
 
 def absolute_lengths_from_strokes(
     strokes_internal: Sequence[float],
-    L0_internal: Sequence[float],
+    l0_internal: Sequence[float],
 ) -> List[float]:
     """几何零位杆长 L0 + 行程 ΔL -> 当前杆长。"""
     s = np.asarray(strokes_internal, dtype=float)
-    l0 = np.asarray(L0_internal, dtype=float)
+    l0 = np.asarray(l0_internal, dtype=float)
     return [round(float(l0[i] + s[i]), 4) for i in range(6)]

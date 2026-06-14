@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Sequence
 
 from protocol_udp import crc16_modbus
 

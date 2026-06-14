@@ -15,6 +15,8 @@ Usage:
     plat.set("disconnect")
 """
 
+# ruff: noqa: E402 — project imports after sys.path setup
+
 from __future__ import annotations
 
 import json
@@ -40,6 +42,7 @@ if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 from calibration import UI_TO_INTERNAL
+from logger_config import get_logger
 from platform_client import PlatformClient, PlatformTarget
 from protocol_control import (
     build_get_info,
@@ -49,15 +52,14 @@ from protocol_control import (
     build_pose_follow_xyz_abc,
 )
 from protocol_udp import (
-    CylinderFormula,
     CyclicFeedback,
+    CylinderFormula,
     absolute_lengths_from_strokes,
     parse_udp_packet,
     pulses_to_strokes_internal,
 )
 from stewart_fk import PlatformConfig, StewartPlatform
 from udp_service import UdpBindError, bind_udp_listen_socket
-from logger_config import get_logger
 
 logger = get_logger(__name__)
 
@@ -115,7 +117,8 @@ class SixAxisPlatform:
         self.load_config(config_path)
 
     def load_config(self, config_path: str) -> bool:
-        path = config_path if os.path.isabs(config_path) else os.path.join(_project_dir, config_path)
+        path = (config_path if os.path.isabs(config_path)
+                else os.path.join(_project_dir, config_path))
         if not os.path.exists(path):
             self.last_error = f"config not found: {path}"
             logger.error("config not found: %s", path)
@@ -155,7 +158,8 @@ class SixAxisPlatform:
             except Exception:
                 pass
 
-            self._client = PlatformClient(PlatformTarget(host=self._platform_ip, port=self._platform_port))
+            self._client = PlatformClient(
+                PlatformTarget(host=self._platform_ip, port=self._platform_port))
             self._config_path = config_path
             self.last_error = None
             return True
@@ -167,7 +171,8 @@ class SixAxisPlatform:
     def connect(self, platform_ip: str | None = None, platform_port: int | None = None) -> bool:
         if platform_ip:
             self._platform_ip = platform_ip
-            self._client = PlatformClient(PlatformTarget(host=platform_ip, port=platform_port or self._platform_port))
+            self._client = PlatformClient(
+                PlatformTarget(host=platform_ip, port=platform_port or self._platform_port))
         if platform_port:
             self._platform_port = platform_port
             if self._client:
@@ -286,7 +291,8 @@ class SixAxisPlatform:
             delta = pose_raw - MID_POSE_ABS
             with self._tracked_lock:
                 self._tracked_rel = delta.copy()
-            pose_deg = [float(round(delta[0], 2)), float(round(delta[1], 2)), float(round(delta[2], 2)),
+            pose_deg = [
+                float(round(delta[0], 2)), float(round(delta[1], 2)), float(round(delta[2], 2)),
                         float(round(np.degrees(delta[3]), 4)),
                         float(round(np.degrees(delta[4]), 4)),
                         float(round(np.degrees(delta[5]), 4))]
@@ -341,7 +347,8 @@ class SixAxisPlatform:
 
     def compute_pose_from_strokes(self, strokes: list[float]) -> dict:
         s = np.array(strokes, dtype=float)
-        pose, ok, n_iter, residual = self._platform.forward_kinematics(s, enforce_stroke_limits=False)
+        pose, ok, n_iter, residual = self._platform.forward_kinematics(
+            s, enforce_stroke_limits=False)
         delta = pose - self._platform.home_pose
         return {
             "pose_raw": pose.tolist(),
@@ -575,7 +582,9 @@ class SixAxisPlatform:
             return False
 
         self.last_error = None
-        logger.info("s_curve start target=%s duration=%.3f settle_timeout=%.3f", target_pose, duration, settle_timeout)
+        logger.info(
+            "s_curve start target=%s duration=%.3f settle_timeout=%.3f",
+            target_pose, duration, settle_timeout)
         cur_abs = self._wait_for_pose()
         if cur_abs is None:
             self.last_error = "未收到 UDP 反馈，无法确认 S 曲线起点"
@@ -603,7 +612,9 @@ class SixAxisPlatform:
         for i, (name, limit) in enumerate(limits):
             if abs(target[i]) > limit:
                 self.last_error = f"{name} 超限: {target[i]:.2f} (limit ±{limit})"
-                logger.error("s_curve target %s out of range: %.2f (limit ±%s)", name, target[i], limit)
+                logger.error(
+                    "s_curve target %s out of range: %.2f (limit ±%s)",
+                    name, target[i], limit)
                 return False
 
         delta = target - start_rel
@@ -621,7 +632,9 @@ class SixAxisPlatform:
             interp = (start_rel + s * delta).tolist()
             if not self.set_pose(interp):
                 self._send_stop()
-                logger.error("s_curve interrupted: set_pose failed at step=%s/%s error=%s", i, steps, self.last_error)
+                logger.error(
+                    "s_curve interrupted: set_pose failed at step=%s/%s error=%s",
+                    i, steps, self.last_error)
                 return False
             # print(f"pt{i}:{interp}")
             time.sleep(dt)
@@ -638,7 +651,9 @@ class SixAxisPlatform:
                         if not self._send_stop():
                             return False
                         self.last_error = None
-                        logger.info("s_curve reached target=%s stable_samples=%s", target.tolist(), stable_cnt)
+                        logger.info(
+                            "s_curve reached target=%s stable_samples=%s",
+                            target.tolist(), stable_cnt)
                         return True
                 else:
                     stable_cnt = 0
@@ -647,7 +662,9 @@ class SixAxisPlatform:
 
         self._send_stop()
         self.last_error = f"S curve target settle timeout: target={target.tolist()}"
-        logger.error("s_curve settle timeout target=%s stable_count=%s", target.tolist(), stable_cnt)
+        logger.error(
+            "s_curve settle timeout target=%s stable_count=%s",
+            target.tolist(), stable_cnt)
         return False
 
     # ── 7. 回原点 ────────────────────────────────────────────

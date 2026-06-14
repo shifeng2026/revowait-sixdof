@@ -9,6 +9,8 @@
   - Y 轴定义：p1–p2 连线中垂线（见 hinge_layout，仅作示意）
 """
 
+# ruff: noqa: N806 — R/T/F/J are standard FK math notation
+
 from __future__ import annotations
 
 import json
@@ -302,7 +304,7 @@ class StewartPlatform:
         return pose - self.home_pose, ok, n, res
 
     def _newton_raphson(
-        self, guess: np.ndarray, L: np.ndarray, tol: float, max_iter: int, verbose: bool
+        self, guess: np.ndarray, lengths: np.ndarray, tol: float, max_iter: int, verbose: bool
     ) -> Tuple[np.ndarray, bool, int, float]:
         vars = guess.copy()
         for it in range(max_iter):
@@ -316,7 +318,7 @@ class StewartPlatform:
             J = np.zeros((6, 6))
             for i in range(6):
                 diff = R @ self.P[i] + T - self.B[i]
-                F[i] = np.dot(diff, diff) - L[i] ** 2
+                F[i] = np.dot(diff, diff) - lengths[i] ** 2
                 J[i, :] = [
                     2.0 * diff[0],
                     2.0 * diff[1],
@@ -342,7 +344,7 @@ class StewartPlatform:
                 F2 = np.array(
                     [
                         np.dot(R2 @ self.P[i] + T2 - self.B[i], R2 @ self.P[i] + T2 - self.B[i])
-                        - L[i] ** 2
+                        - lengths[i] ** 2
                         for i in range(6)
                     ]
                 )
@@ -356,7 +358,7 @@ class StewartPlatform:
         F = np.array(
             [
                 np.dot(R @ self.P[i] + T - self.B[i], R @ self.P[i] + T - self.B[i])
-                - L[i] ** 2
+                - lengths[i] ** 2
                 for i in range(6)
             ]
         )

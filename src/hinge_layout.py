@@ -23,17 +23,17 @@ def y_axis_from_p1_p2(
     """
     p1 = np.asarray(p1, dtype=float)
     p2 = np.asarray(p2, dtype=float)
-    Z = np.array([0.0, 0.0, 1.0]) if z_up is None else np.asarray(z_up, dtype=float)
-    Z = Z / np.linalg.norm(Z)
+    z_vec = np.array([0.0, 0.0, 1.0]) if z_up is None else np.asarray(z_up, dtype=float)
+    z_vec = z_vec / np.linalg.norm(z_vec)
 
     mid = 0.5 * (p1 + p2)
-    X = p2 - p1
-    X[2] = 0.0
-    nx = np.linalg.norm(X)
+    x_vec = p2 - p1
+    x_vec[2] = 0.0
+    nx = np.linalg.norm(x_vec)
     if nx < 1e-9:
         raise ValueError("p1 与 p2 在水平面几乎重合，无法定义 Y 轴")
-    X = X / nx
+    x_vec = x_vec / nx
 
-    Y = np.cross(Z, X)
-    Y = Y / np.linalg.norm(Y)
-    return Y, mid
+    y_vec = np.cross(z_vec, x_vec)
+    y_vec = y_vec / np.linalg.norm(y_vec)
+    return y_vec, mid
