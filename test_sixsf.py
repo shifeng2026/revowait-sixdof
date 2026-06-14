@@ -99,10 +99,10 @@ class SixAxisPlatform:
 
         self._formula = CylinderFormula()
         self._proto_map: tuple = tuple(UI_TO_INTERNAL)
-        self._listen_host = "192.168.31.100"
-        self._listen_port = 8080
-        self._platform_ip = "192.168.31.88"
-        self._platform_port = 8080
+        self._listen_host = ""
+        self._listen_port = 0
+        self._platform_ip = ""
+        self._platform_port = 0
         self._pose_z_offset_mm = DEFAULT_POSE_Z_OFFSET_MM
 
         self.last_error: str | None = None
@@ -664,7 +664,7 @@ def _demo(ip=None, port=8080):
         # time.sleep(2)
 
         print("--- 3. move_pose_s_curve: [0,0,0,0,0,0] 2s ---")
-        plat.move_pose_s_curve([0, 0, 0, 0, 0, -10], duration=1.0)
+        plat.move_pose_s_curve([0, 0, 0, 0, 0, 10], duration=1.0)
         time.sleep(2)
 
         # print("--- 4. move_pose_s_curve: [50,0,100,5,0,0] 3s ---")
