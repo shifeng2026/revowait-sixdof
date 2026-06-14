@@ -62,8 +62,10 @@ from protocol_udp import (
 from stewart_fk import PlatformConfig, StewartPlatform
 from udp_service import UdpBindError, bind_udp_listen_socket
 
-# 中位绝对位姿（mm / rad）
-MID_POSE_ABS = np.array([0, 0, 910, 0, 0, 0], dtype=float)
+# 控制器中位绝对位姿（mm / rad）
+# 下位机以该位姿为相对零点的参考基准，与 kinematic home_pose 不同。
+# home_pose = 运动学零位（行程=0），中位 = 控制器相对坐标的原点。
+MID_POSE_ABS = np.array([0, 0, 920, 0, 0, 0], dtype=float)
 DEFAULT_POSE_Z_OFFSET_MM = 10.0
 
 
@@ -267,8 +269,13 @@ class SixAxisPlatform:
             pose_raw, fk_ok, _, fk_res = self._platform.forward_kinematics(
                 strokes, guess=self._platform.home_pose.copy(), enforce_stroke_limits=False
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_error = f"FK 正解失败: {e}"
+
+        if pose_raw is not None:
+            # FK 坐标 → 控制器坐标：X/Y/RX/RY 取反
+            _SIGN = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0])
+            pose_raw = pose_raw * _SIGN
 
         home = self._platform.home_pose
         if pose_raw is not None:
@@ -351,9 +358,16 @@ class SixAxisPlatform:
         """
         发送中位指令，轮询到位后立即 stop，再补发一次中位，
         避免下位机过冲后继续运行。
+        到位判定：绝对位姿与 MID_POSE_ABS 偏差 < 阈值。
         """
         if not self.connected:
             self.last_error = "未连接"
+            return False
+
+        # ── 0. 等待首包 UDP 反馈 ──────────────────────────────
+        first = self._wait_for_pose()
+        if first is None:
+            self.last_error = "未收到 UDP 反馈"
             return False
 
         # ── 1. 发中位 ──────────────────────────────────────────
@@ -403,10 +417,20 @@ class SixAxisPlatform:
 
     # ── 8. S 型位姿规划 ─────────────────────────────────────
 
+    def _wait_for_pose(self, timeout: float = 2.0) -> np.ndarray | None:
+        """等待 UDP 反馈到达，返回 pose_raw；超时返回 None"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            cur = self.read_current_pose()
+            if cur is not None and cur.get("pose_raw") is not None:
+                return np.array(cur["pose_raw"], dtype=float)
+            time.sleep(0.02)
+        return None
+
     def move_pose_s_curve(self, target_pose: list[float], duration: float = 2.0) -> bool:
         """
         S 型规划：在 duration 秒内从当前位置插补到 target_pose。
-        target_pose 是相对中位 (0,0,910,0,0,0) 的增量
+        target_pose 是相对中位 (MID_POSE_ABS) 的增量
         [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]。
         起点 = 当前绝对位姿 .pose_raw − MID_POSE_ABS，统一到中位坐标系。
         内部 10ms 循环调用 set_pose。
@@ -415,25 +439,31 @@ class SixAxisPlatform:
             self.last_error = "未连接"
             return False
 
-        cur = self.read_current_pose()
-        if cur is not None and cur.get("pose_raw") is not None:
-            cur_abs = np.array(cur["pose_raw"], dtype=float)
-        else:
+        cur_abs = self._wait_for_pose()
+        if cur_abs is None:
+            print("  [警告] 未收到 UDP 反馈，使用 MID_POSE_ABS 作为当前位姿")
             cur_abs = MID_POSE_ABS.copy()
+        else:
+            print(f"当前绝对位姿: {cur_abs.tolist()}")
 
-        start_in_mid = cur_abs - MID_POSE_ABS
-        start_in_mid[3:] = np.degrees(start_in_mid[3:])
+        start_rel = cur_abs - MID_POSE_ABS
+        print(f"中位绝对位姿: {MID_POSE_ABS.tolist()}")
+        print(f"(中位 - home_pose Z差: {MID_POSE_ABS[2] - self._platform.home_pose[2]:.1f}mm)")
+        start_rel[3:] = np.degrees(start_rel[3:])
 
         target = np.array(target_pose, dtype=float)
-        delta = target - start_in_mid
-
-        dt = 0.01
+        delta = target - start_rel
+        print(f"当前位姿 (相对中位): {start_rel.tolist()}")
+        print(f"目标位姿 (相对中位): {target.tolist()}")
+        print(f"位姿增量: {delta.tolist()}")
+        
+        dt = 0.02
         steps = max(2, int(duration / dt))
 
         for i in range(1, steps + 1):
             t = i / steps
             s = 3 * t * t - 2 * t * t * t
-            interp = (start_in_mid + s * delta).tolist()
+            interp = (start_rel + s * delta).tolist()
             if not self.set_pose(interp):
                 return False
             print(f"点{i}:{interp}")
@@ -485,8 +515,13 @@ def _print_pose(line_header, data):
 def _demo_read_worker(plat, stop_event):
     while not stop_event.is_set():
         data = plat.read_current_pose()
-        # print(f"shifeng pose:{data}")
-        _print_pose("async", data)
+        if data is not None and data.get("pose_raw") is not None:
+            r = data["pose_raw"]
+            s = data["strokes"]
+            print(f"    X{r[0]:7.1f} ，Y{r[1]:7.1f} ，Z{r[2]:7.1f}"
+                  f" rx{np.degrees(r[3]):6.2f} ry{np.degrees(r[4]):6.2f} rz{np.degrees(r[5]):6.2f}"
+                  f"  S[{s[0]:5.1f} {s[1]:5.1f} {s[2]:5.1f} {s[3]:5.1f} {s[4]:5.1f} {s[5]:5.1f}]",
+                  flush=True)
         stop_event.wait(0.1)
 
 
@@ -509,20 +544,20 @@ def _demo(ip=None, port=8080):
         # plat.move_to_mid()
         # build_plat_top
         # ── 回到原点 ───────────────────────────────────────────
-        # plat.set_pose([0, 0, 10, 0, 0, 0])
+        # plat.set_pose([200, 0, 0, 0, 0, 0])
         # time.sleep(2)
 
-        # print("--- 3. move_pose_s_curve: [0,0,100,0,0,0] 2s ---")
-        # plat.move_pose_s_curve([0, 0, -100, 0, 0, 0], duration=2.0)
-        # time.sleep(2)
+        print("--- 3. move_pose_s_curve: [0,0,0,0,0,0] 2s ---")
+        plat.move_pose_s_curve([0, 0, 0, 0, 0, -10], duration=1.0)
+        time.sleep(2)
 
         # print("--- 4. move_pose_s_curve: [50,0,100,5,0,0] 3s ---")
         # plat.move_pose_s_curve([0, 0, 100, 0, 0, 0], duration=3.0)
         # time.sleep(2)
 
         # print("--- 5. move_pose_s_curve: [0,0,0,0,0,0] (回零) 2s ---")
-        # plat.move_pose_s_curve([0, 0, 0, 0, 0, 0], duration=2.0)
-        time.sleep(2)
+        # plat.move_pose_s_curve([0, 0, 100, 0, 0, 0], duration=2.0)
+        # time.sleep(2)
         # time.sleep(5)
         # ── 停止读取线程 ──────────────────────────────────────
         stop_read.set()
