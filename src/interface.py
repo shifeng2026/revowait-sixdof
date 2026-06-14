@@ -1,30 +1,18 @@
 """
-六轴平台轻量化控制接口 (Lightweight Six-Axis Platform Control API)
-
-Features:
-  1. UDP 连接/断开
-  2. 设置目标位姿（相对中位增量，通过 0x20 位姿随动一次性发送）
-  3. 实时读取目标位姿
-  4. 电缸伸长量 -> 位姿正解
-  5. 加载平台默认配置
-  6. 移动到中位
-  7. 回原点
+六轴平台轻量化控制接口
 
 Usage:
-    from test_sixsf import SixAxisPlatform
+    from interface import SixAxisPlatform
 
-    plat = SixAxisPlatform("platform_config.json")
+    plat = SixAxisPlatform()
     plat.connect()
 
-    pose = plat.read_current_pose()
-    plat.set_pose([0, 0, 100, 0, 0, 0])       # Z 抬高 100mm
-    plat.set_pose([50, 0, 100, 5, 0, 0])       # X+50mm, rx+5°
-
-    result = plat.compute_pose_from_strokes([10, -5, 3, 7, -2, 0])
-
-    plat.move_to_mid()
-    plat.move_to_home()
-    plat.disconnect()
+    pose = plat.set("read_pose")
+    plat.set("pose", [0, 0, 100, 0, 0, 0])
+    plat.set("move_pose_s_curve", [0, 0, 0, 0, 0, 5], duration=1.0)
+    plat.set("move_to_mid")
+    plat.set("move_to_home")
+    plat.set("disconnect")
 """
 
 from __future__ import annotations
@@ -36,7 +24,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -46,9 +34,10 @@ try:
 except ImportError:
     _HAS_MPL = False
 
-_project_dir = os.path.dirname(os.path.abspath(__file__))
-if _project_dir not in sys.path:
-    sys.path.insert(0, _project_dir)
+_src_dir = os.path.dirname(os.path.abspath(__file__))
+_project_dir = os.path.dirname(_src_dir)
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 
 from calibration import UI_TO_INTERNAL
 from platform_client import PlatformClient, PlatformTarget
@@ -68,17 +57,14 @@ from protocol_udp import (
 )
 from stewart_fk import PlatformConfig, StewartPlatform
 from udp_service import UdpBindError, bind_udp_listen_socket
+from logger_config import get_logger
 
-# 控制器中位绝对位姿（mm / rad）
-# 下位机以该位姿为相对零点的参考基准，与 kinematic home_pose 不同。
-# home_pose = 运动学零位（行程=0），中位 = 控制器相对坐标的原点。
+logger = get_logger(__name__)
+
 MID_POSE_ABS = np.array([0, 0, 920, 0, 0, 0], dtype=float)
 DEFAULT_POSE_Z_OFFSET_MM = 10.0
-
-# FK 坐标 → 控制器坐标：X/Y/RX/RY 取反
 _FK_TO_CONTROLLER_SIGN = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0])
 
-# 实时曲线默认滚动窗口（秒）
 _PLOT_WINDOW_SEC = 10.0
 _PLOT_MAX_POINTS = 300
 _SCURVE_DT_SEC = 0.02
@@ -86,9 +72,14 @@ _TARGET_POS_TOL_MM = 0.5
 _TARGET_ATT_TOL_DEG = 0.05
 _TARGET_STABLE_SAMPLES = 5
 
+# 轴限位（相对中位增量）
+_POS_LIMIT_MM = 200.0
+_ROLL_LIMIT_DEG = 25.0
+_PITCH_LIMIT_DEG = 25.0
+_YAW_LIMIT_DEG = 28.0
+
 
 class SixAxisPlatform:
-    """六轴平台控制接口"""
 
     def __init__(self, config_path: str = "platform_config.json"):
         self._config_path: str = config_path
@@ -110,9 +101,8 @@ class SixAxisPlatform:
         self._pose_z_offset_mm = DEFAULT_POSE_Z_OFFSET_MM
 
         self.last_error: str | None = None
-        self._tracked_rel: np.ndarray = np.zeros(6)  # 开环追踪最近一次目标/反馈位姿（角度为弧度）
+        self._tracked_rel: np.ndarray = np.zeros(6)
 
-        # ── 实时曲线状态 ──
         self._plot_buffers: dict | None = None
         self._plot_fig: plt.Figure | None = None
         self._plot_axes: list[plt.Axes] | None = None
@@ -124,13 +114,11 @@ class SixAxisPlatform:
 
         self.load_config(config_path)
 
-    # ── 5. 加载配置 ──────────────────────────────────────────
-
     def load_config(self, config_path: str) -> bool:
-        """重新加载平台配置文件（几何 + UDP 参数）"""
         path = config_path if os.path.isabs(config_path) else os.path.join(_project_dir, config_path)
         if not os.path.exists(path):
-            self.last_error = f"配置不存在: {path}"
+            self.last_error = f"config not found: {path}"
+            logger.error("config not found: %s", path)
             return False
 
         try:
@@ -144,9 +132,8 @@ class SixAxisPlatform:
             self._listen_port = int(udp.get("listen_port", 8080))
             self._platform_ip = str(udp.get("platform_ip", "192.168.31.88"))
             self._platform_port = int(udp.get("platform_port", 8080))
-            pose_control = d.get("pose_control", {})
             self._pose_z_offset_mm = float(
-                pose_control.get("z_offset_mm", DEFAULT_POSE_Z_OFFSET_MM)
+                d.get("pose_control", {}).get("z_offset_mm", DEFAULT_POSE_Z_OFFSET_MM)
             )
 
             cyl = udp.get("cylinder", {})
@@ -160,7 +147,6 @@ class SixAxisPlatform:
             )
             self._proto_map = tuple(udp.get("protocol_to_internal", list(UI_TO_INTERNAL)))
 
-            # 正解零位校准：FK(ΔL=0) → home_pose，保证原点 pose_rel = 0
             try:
                 zero_fk, _, _, _ = self._platform.forward_kinematics(
                     np.zeros(6), guess=self._platform.home_pose.copy(), enforce_stroke_limits=False
@@ -175,12 +161,10 @@ class SixAxisPlatform:
             return True
         except Exception as e:
             self.last_error = str(e)
+            logger.exception("config load failed path=%s", path)
             return False
 
-    # ── 1. UDP 连接 / 断开 ───────────────────────────────────
-
     def connect(self, platform_ip: str | None = None, platform_port: int | None = None) -> bool:
-        """连接平台：启动 UDP 监听 + 发送探测包"""
         if platform_ip:
             self._platform_ip = platform_ip
             self._client = PlatformClient(PlatformTarget(host=platform_ip, port=platform_port or self._platform_port))
@@ -202,7 +186,6 @@ class SixAxisPlatform:
         return True
 
     def disconnect(self) -> None:
-        """断开平台连接"""
         self._stop_listener()
         if self._client:
             self._client.disconnect()
@@ -253,10 +236,8 @@ class SixAxisPlatform:
         parsed = parse_udp_packet(data, self._formula)
         if not isinstance(parsed, CyclicFeedback):
             return
-
         fb = parsed
         strokes_int = pulses_to_strokes_internal(fb.pulses, self._formula, self._proto_map)
-
         with self._lock:
             self._latest = {
                 "timestamp": time.time(),
@@ -271,31 +252,18 @@ class SixAxisPlatform:
             return self._latest
 
     def _pose_for_protocol(self, pose_mid: np.ndarray) -> np.ndarray:
-        """用户位姿以中位为零点；29 字节协议 Z 轴需要扣除硬件保护偏置。"""
         pose = np.asarray(pose_mid, dtype=float)
         if pose.shape != (6,):
-            raise ValueError("需要 6 个位姿值 [x_mm,y_mm,z_mm,rx_deg,ry_deg,rz_deg]")
+            raise ValueError("pose must have 6 values [x,y,z,rx,ry,rz]")
         protocol_pose = pose.copy()
         protocol_pose[2] -= self._pose_z_offset_mm
         return protocol_pose
 
-    # ── 3. 实时读取位姿 + 扭矩（调用时实时正解） ──────────────
-
     def read_current_pose(self, show_plot: bool = False, record_error: bool = True) -> dict | None:
-        """
-        返回最新 UDP 反馈，实时正解，输出绝对位姿 + 相对 home 增量。
-
-        Parameters
-        ----------
-        show_plot : bool
-            True 时弹出实时位置/速度曲线窗口（需 matplotlib）。
-        record_error : bool
-            True 时把读取/FK/绘图错误写入 last_error；后台显示线程应使用 False。
-        """
         snap = self._get_latest()
         if snap is None:
             if record_error:
-                self.last_error = "未收到 UDP 反馈"
+                self.last_error = "no udp feedback"
             return None
 
         strokes = np.array(snap["strokes_internal"], dtype=float)
@@ -310,21 +278,18 @@ class SixAxisPlatform:
             )
         except Exception as e:
             if record_error:
-                self.last_error = f"FK 正解失败: {e}"
+                self.last_error = f"FK failed: {e}"
 
         if pose_raw is not None:
             pose_raw = pose_raw * _FK_TO_CONTROLLER_SIGN
-
-        home = self._platform.home_pose
-        if pose_raw is not None:
             self.last_error = None
-            delta = pose_raw - home
+            delta = pose_raw - MID_POSE_ABS
             with self._tracked_lock:
                 self._tracked_rel = delta.copy()
-            pose_deg = [round(delta[0], 2), round(delta[1], 2), round(delta[2], 2),
-                        round(np.degrees(delta[3]), 4),
-                        round(np.degrees(delta[4]), 4),
-                        round(np.degrees(delta[5]), 4)]
+            pose_deg = [float(round(delta[0], 2)), float(round(delta[1], 2)), float(round(delta[2], 2)),
+                        float(round(np.degrees(delta[3]), 4)),
+                        float(round(np.degrees(delta[4]), 4)),
+                        float(round(np.degrees(delta[5]), 4))]
         else:
             delta = None
             pose_deg = None
@@ -348,15 +313,9 @@ class SixAxisPlatform:
 
         return result
 
-    # ── 2. 设置目标位姿（相对中位增量） ─────────────────────
-
     def set_pose(self, pose_deg: list[float]) -> bool:
-        """
-        位姿随动，输入 = 相对中位的增量 [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]。
-        发送前统一转换为 29 字节协议位姿。
-        """
         if not self.connected:
-            self.last_error = "未连接"
+            self.last_error = "not connected"
             return False
 
         target_mid = np.array(pose_deg, dtype=float)
@@ -380,10 +339,7 @@ class SixAxisPlatform:
             self._tracked_rel = target_mid_rad.copy()
         return True
 
-    # ── 4. 电缸伸长量 -> 位姿（正解） ────────────────────────
-
     def compute_pose_from_strokes(self, strokes: list[float]) -> dict:
-        """正解：输入 6 个电缸行程 ΔL (mm)，返回绝对 + 相对位姿"""
         s = np.array(strokes, dtype=float)
         pose, ok, n_iter, residual = self._platform.forward_kinematics(s, enforce_stroke_limits=False)
         delta = pose - self._platform.home_pose
@@ -399,33 +355,23 @@ class SixAxisPlatform:
             "residual": residual,
         }
 
-    # ── 6. 移动到中位 ────────────────────────────────────────
-
     def move_to_mid(self) -> bool:
-        """
-        发送中位指令，轮询到位后立即 stop，再补发一次中位，
-        避免下位机过冲后继续运行。
-        到位判定：绝对位姿与 MID_POSE_ABS 偏差 < 阈值。
-        """
         if not self.connected:
-            self.last_error = "未连接"
+            self.last_error = "not connected"
             return False
 
-        # ── 0. 等待首包 UDP 反馈 ──────────────────────────────
         first = self._wait_for_pose()
         if first is None:
-            self.last_error = "未收到 UDP 反馈"
+            self.last_error = "no udp feedback"
             return False
 
-        # ── 1. 发中位 ──────────────────────────────────────────
         ok, msg = self._client.send(build_plat_mid())
         if not ok:
             self.last_error = msg
             return False
 
-        # ── 2. 轮询到位（与 MID_POSE_ABS 偏差 < 阈值） ────────
-        pos_tol = 0.5          # mm
-        ang_tol = np.radians(0.05)  # rad
+        pos_tol = 0.5
+        ang_tol = np.radians(0.05)
         stable_req = 5
         stable_cnt = 0
         prev = None
@@ -446,24 +392,17 @@ class SixAxisPlatform:
                 prev = cur_abs
             time.sleep(0.01)
 
-        # ── 3. stop ────────────────────────────────────────────
         if not self._send_stop():
             return False
 
         time.sleep(0.05)
-
-        # ── 5. 再发一次中位 ────────────────────────────────────
         ok, msg = self._client.send(build_plat_mid())
         if not ok:
             self.last_error = msg
             return False
-
         return True
 
-    # ── 8. S 型位姿规划 ─────────────────────────────────────
-
     def _wait_for_pose(self, timeout: float = 2.0) -> np.ndarray | None:
-        """等待 UDP 反馈到达，返回 pose_raw；超时返回 None"""
         t0 = time.time()
         while time.time() - t0 < timeout:
             cur = self.read_current_pose(record_error=False)
@@ -473,18 +412,14 @@ class SixAxisPlatform:
         return None
 
     def _controller_rel_from_abs(self, pose_abs: np.ndarray) -> np.ndarray:
-        """绝对反馈位姿 -> 相对中位的控制位姿；平移 mm，姿态 deg。"""
         rel = np.asarray(pose_abs, dtype=float) - MID_POSE_ABS
         rel[3:] = np.degrees(rel[3:])
         return rel
 
     @staticmethod
     def _pose_close_to_target(
-        pose_rel: np.ndarray,
-        target_rel: np.ndarray,
-        *,
-        pos_tol_mm: float = _TARGET_POS_TOL_MM,
-        att_tol_deg: float = _TARGET_ATT_TOL_DEG,
+        pose_rel: np.ndarray, target_rel: np.ndarray,
+        *, pos_tol_mm: float = _TARGET_POS_TOL_MM, att_tol_deg: float = _TARGET_ATT_TOL_DEG,
     ) -> bool:
         diff = np.abs(np.asarray(pose_rel, dtype=float) - np.asarray(target_rel, dtype=float))
         return bool(np.all(diff[:3] <= pos_tol_mm) and np.all(diff[3:] <= att_tol_deg))
@@ -497,8 +432,6 @@ class SixAxisPlatform:
         self.last_error = None
         return True
 
-    # ── 9. 实时位置/速度曲线 ─────────────────────────────────
-
     def start_realtime_plot(self) -> bool:
         """
         在主线程中调用，弹出 matplotlib 实时曲线窗口。
@@ -507,6 +440,7 @@ class SixAxisPlatform:
         """
         if not _HAS_MPL:
             self.last_error = "matplotlib 未安装，无法显示实时曲线"
+            logger.error("realtime plot unavailable: matplotlib not installed")
             return False
 
         if self._plot_fig is not None:
@@ -573,6 +507,7 @@ class SixAxisPlatform:
             self._animation = FuncAnimation(fig, animate, interval=50, cache_frame_data=False)
             fig.show()
             self.last_error = None
+            logger.info("realtime plot started")
             return True
         except Exception as e:
             self._plot_buffers = None
@@ -583,6 +518,7 @@ class SixAxisPlatform:
             self._plot_lines_vel = None
             self._animation = None
             self.last_error = f"实时曲线初始化失败: {e}"
+            logger.exception("realtime plot initialization failed")
             return False
 
     def _update_realtime_plot(self, timestamp: float, pose_rel: np.ndarray) -> None:
@@ -635,31 +571,49 @@ class SixAxisPlatform:
         """
         if not self.connected:
             self.last_error = "未连接"
+            logger.error("move_pose_s_curve rejected: not connected target=%s", target_pose)
             return False
 
         self.last_error = None
+        logger.info("s_curve start target=%s duration=%.3f settle_timeout=%.3f", target_pose, duration, settle_timeout)
         cur_abs = self._wait_for_pose()
         if cur_abs is None:
             self.last_error = "未收到 UDP 反馈，无法确认 S 曲线起点"
+            logger.error("s_curve failed: no start feedback target=%s", target_pose)
             return False
 
-        print(f"当前绝对位姿: {cur_abs.tolist()}")
+        # print(f"当前绝对位姿: {cur_abs.tolist()}")
         start_rel = self._controller_rel_from_abs(cur_abs)
-        print(f"中位绝对位姿: {MID_POSE_ABS.tolist()}")
-        print(f"(中位 - home_pose Z差: {MID_POSE_ABS[2] - self._platform.home_pose[2]:.1f}mm)")
+        logger.info("s_curve start_pose_abs=%s start_rel=%s", cur_abs.tolist(), start_rel.tolist())
+        # print(f"中位绝对位姿: {MID_POSE_ABS.tolist()}")
+        # print(f"(中位 - home_pose Z差: {MID_POSE_ABS[2] - self._platform.home_pose[2]:.1f}mm)")
 
         target = np.array(target_pose, dtype=float)
         if target.shape != (6,):
             self.last_error = "target_pose 需要 6 个值 [x_mm,y_mm,z_mm,rx_deg,ry_deg,rz_deg]"
+            logger.error("s_curve invalid target=%s", target_pose)
             return False
 
+        limits = [
+            ("x", _POS_LIMIT_MM), ("y", _POS_LIMIT_MM), ("z", _POS_LIMIT_MM),
+            ("rx(roll)", _ROLL_LIMIT_DEG),
+            ("ry(pitch)", _PITCH_LIMIT_DEG),
+            ("rz(yaw)", _YAW_LIMIT_DEG),
+        ]
+        for i, (name, limit) in enumerate(limits):
+            if abs(target[i]) > limit:
+                self.last_error = f"{name} 超限: {target[i]:.2f} (limit ±{limit})"
+                logger.error("s_curve target %s out of range: %.2f (limit ±%s)", name, target[i], limit)
+                return False
+
         delta = target - start_rel
-        print(f"当前位姿 (相对中位): {start_rel.tolist()}")
-        print(f"目标位姿 (相对中位): {target.tolist()}")
-        print(f"位姿增量: {delta.tolist()}")
+        # print(f"当前位姿 (相对中位): {start_rel.tolist()}")
+        # print(f"目标位姿 (相对中位): {target.tolist()}")
+        # print(f"位姿增量: {delta.tolist()}")
 
         dt = _SCURVE_DT_SEC
         steps = max(2, int(duration / dt))
+        logger.info("s_curve trajectory steps=%s dt=%.3f delta=%s", steps, dt, delta.tolist())
 
         for i in range(1, steps + 1):
             t = i / steps
@@ -667,8 +621,9 @@ class SixAxisPlatform:
             interp = (start_rel + s * delta).tolist()
             if not self.set_pose(interp):
                 self._send_stop()
+                logger.error("s_curve interrupted: set_pose failed at step=%s/%s error=%s", i, steps, self.last_error)
                 return False
-            print(f"pt{i}:{interp}")
+            # print(f"pt{i}:{interp}")
             time.sleep(dt)
 
         stable_cnt = 0
@@ -683,6 +638,7 @@ class SixAxisPlatform:
                         if not self._send_stop():
                             return False
                         self.last_error = None
+                        logger.info("s_curve reached target=%s stable_samples=%s", target.tolist(), stable_cnt)
                         return True
                 else:
                     stable_cnt = 0
@@ -691,6 +647,7 @@ class SixAxisPlatform:
 
         self._send_stop()
         self.last_error = f"S curve target settle timeout: target={target.tolist()}"
+        logger.error("s_curve settle timeout target=%s stable_count=%s", target.tolist(), stable_cnt)
         return False
 
     # ── 7. 回原点 ────────────────────────────────────────────
@@ -699,103 +656,61 @@ class SixAxisPlatform:
         """发送回原点指令"""
         if not self.connected:
             self.last_error = "未连接"
+            logger.error("move_to_home rejected: not connected")
             return False
         ok, msg = self._client.send(build_plat_reset())
         if not ok:
             self.last_error = msg
+            logger.error("move_to_home send failed: %s", msg)
             return False
         with self._tracked_lock:
             self._tracked_rel[:] = 0.0
+        self.last_error = None
+        logger.info("move_to_home command sent")
         return True
 
+    # ── 8. 统一 Set / Get 接口 ─────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════
-#  演示程序
-# ═══════════════════════════════════════════════════════════════
+    def set(self, key: str, value: Any = None, **kwargs) -> Any:
+        """
+        统一命令接口。
 
-def _print_pose(line_header, data):
-    """多行显示正解六轴位姿 + 行程 + 扭矩"""
-    if data is None:
-        print(f"  {line_header}: (no feedback)", flush=True)
-        return
-    raw = data.get("pose_raw")
-    rel = data.get("pose_rel")
-    s = data.get("strokes")
-    t = data.get("torques")
-    print(f"  {line_header}:")
-    if raw:
-        print(f"    绝对[X{raw[0]:7.1f} Y{raw[1]:7.1f} Z{raw[2]:7.1f}"
-              f" rx{np.degrees(raw[3]):6.2f} ry{np.degrees(raw[4]):6.2f} rz{np.degrees(raw[5]):6.2f}]")
-    if rel:
-        print(f"    增量[x{rel[0]:7.1f} y{rel[1]:7.1f} z{rel[2]:7.1f}"
-              f" rx{np.degrees(rel[3]):6.2f} ry{np.degrees(rel[4]):6.2f} rz{np.degrees(rel[5]):6.2f}]")
-    if s:
-        print(f"    S:[{s[0]:6.1f} {s[1]:6.1f} {s[2]:6.1f} {s[3]:6.1f} {s[4]:6.1f} {s[5]:6.1f}]")
-    if t:
-        print(f"    T:[{t[0]:5d} {t[1]:5d} {t[2]:5d} {t[3]:5d} {t[4]:5d} {t[5]:5d}]")
+        key 支持:
+          connect           - value=str(ip) 可选
+          disconnect
+          read_pose         - 返回 read_current_pose() 结果
+          pose              - value=list[6] 相对中位增量
+          move_pose_s_curve - value=list[6], kwargs: duration=
+          move_to_home
+          move_to_mid
+        """
+        actions = {
+            "connect": lambda: self.connect(
+                value if isinstance(value, str) else None,
+                kwargs.get("port"),
+            ),
+            "disconnect": lambda: self.disconnect(),
+            "pose": lambda: self.set_pose(value, **kwargs),
+            "move_pose_s_curve": lambda: self.move_pose_s_curve(value, **kwargs),
+            "move_to_home": lambda: self.move_to_home(),
+            "move_to_mid": lambda: self.move_to_mid(),
+        }
+        fn = actions.get(key)
+        if fn is None:
+            self.last_error = f"unknown command: {key}"
+            return None
+        return fn()
 
-
-def _demo_read_worker(plat, stop_event, show_plot=False):
-    while not stop_event.is_set():
-        data = plat.read_current_pose(show_plot=show_plot, record_error=False)
-        if data is not None and data.get("pose_raw") is not None:
-            r = data["pose_raw"]
-            s = data["strokes"]
-            print(f"    X{r[0]:7.1f} ，Y{r[1]:7.1f} ，Z{r[2]:7.1f}"
-                  f" rx{np.degrees(r[3]):6.2f} ry{np.degrees(r[4]):6.2f} rz{np.degrees(r[5]):6.2f}"
-                  f"  S[{s[0]:5.1f} {s[1]:5.1f} {s[2]:5.1f} {s[3]:5.1f} {s[4]:5.1f} {s[5]:5.1f}]",
-                  flush=True)
-        stop_event.wait(0.1)
-
-
-def _demo(ip=None, port=8080):
-
-    plat = SixAxisPlatform()
-    ok = plat.connect(ip, port)
-    if not ok:
-        print(f"  last_error: {plat.last_error}")
-        print("  (hardware not reachable, skip network tests)")
-    else:
-        print(f"  connected: {plat.connected}")
-
-        # ── 主线程创建实时曲线窗口（可选） ────────────────────
-        show_plot = True   # 改成 False 则不弹窗
-        if show_plot:
-            plat.start_realtime_plot()
-        print("--- 2. 异步读取线程已启动" + (" (带实时曲线)" if show_plot else "") + " ---")
-
-        stop_read = threading.Event()
-        read_thread = threading.Thread(target=_demo_read_worker, args=(plat, stop_read, show_plot), daemon=True)
-        read_thread.start()
-
-        print("--- 3. move_pose_s_curve: [0,0,0,0,0,5] 1s ---")
-        ok = plat.move_pose_s_curve([0, 0, 0, 0, 0, 5], duration=1.0)
-        print(f"  move_pose_s_curve returned: {ok}, last_error={plat.last_error}")
-
-        # ── 泵 GUI 事件循环，FuncAnimation 才能刷新曲线 ──────
-        print("--- 4. sleep 10s (GUI active) ---")
-        t_end = time.time() + 10
-        while time.time() < t_end:
-            if show_plot and _HAS_MPL:
-                plt.pause(0.05)
-            else:
-                time.sleep(0.05)
-
-        # ── 停止读取线程 ──────────────────────────────────────
-        stop_read.set()
-        read_thread.join(timeout=2)
-
-        # ── 断开 ──────────────────────────────────────────────
-        print("--- 5. disconnect ---")
-        plat.close()
-        plat.disconnect()
-        print(f"  connected: {plat.connected}")
-        print()
-
-    print("=" * 70)
-    print("  demo finished")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    _demo()
+    def get(self, key: str) -> Any:
+        """统一查询接口。key 支持: pose, connected, last_error, pose_raw"""
+        state = {
+            "pose": lambda: self.read_current_pose(),
+            "connected": lambda: self.connected,
+            "last_error": lambda: self.last_error,
+            # "read_pose": lambda: self.read_current_pose(**kwargs),
+            "pose_deg": lambda: (
+                r.get("pose_deg") if (r := self.read_current_pose()) else None
+            ),
+        }
+        fn = state.get(key)
+        return fn() if fn is not None else None

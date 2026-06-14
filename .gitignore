@@ -11,5 +11,7 @@ venv/
 env/
 
 *.log
+logs/*.log
 .DS_Store
 Thumbs.db
+test_sf.py
