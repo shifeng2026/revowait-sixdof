@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build daq-plc-interface wheel into dist/.
+# Build six-axis-platform wheel into dist/.
 #
 #   bash scripts/build-wheel.sh
 #   PKG_VERSION=0.1.4+sha.abc123 bash scripts/build-wheel.sh
@@ -35,7 +35,7 @@ if [[ -n "${PKG_VERSION:-}" ]]; then
     export SETUPTOOLS_SCM_PRETEND_VERSION="$PKG_VERSION"
 fi
 
-echo "==> Building daq-plc-interface wheel (version=${SETUPTOOLS_SCM_PRETEND_VERSION:-scm})"
+echo "==> Building six-axis-platform wheel (version=${SETUPTOOLS_SCM_PRETEND_VERSION:-scm})"
 rm -rf dist build *.egg-info daq_plc_interface/*.egg-info
 python -m build --wheel
 

@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stewart-platform-fk"
+name = "six-axis-platform"
 dynamic = ["version"]
-description = "Stewart platform forward kinematics control interface"
+description = "六轴平台控制接口 (Six-axis platform control interface)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

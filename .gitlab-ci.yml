@@ -13,7 +13,7 @@ variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
   PIP_BREAK_SYSTEM_PACKAGES: "1"
   PIP_INDEX_URL: "https://mirrors.ustc.edu.cn/pypi/simple"
-  CI_PACKAGE_NAME: "daq-plc-interface"
+  CI_PACKAGE_NAME: "six-axis-platform"
 
 default:
   image: registry.jihulab.com/discoverrobotics/s2-restricted/data-factory/automation/ubuntu:24.04

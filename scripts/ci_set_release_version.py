@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive wheel versions for daq-plc-interface CI builds."""
+"""Derive wheel versions for six-axis-platform CI builds."""
 
 from __future__ import annotations
 
